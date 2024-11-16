@@ -1,52 +1,151 @@
-import streamlit as st
+import re
+import pdfplumber
 import pandas as pd
-import plotly.express as px
+import sqlite3
+import streamlit as st
 
-# Load the Excel file
-uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
-if uploaded_file:
-    # Read all sheets
-    stock_reports = pd.read_excel(uploaded_file, sheet_name='Stock Reports')
-    purchase_orders = pd.read_excel(uploaded_file, sheet_name='Purchase Orders')
-    orders = pd.read_excel(uploaded_file, sheet_name='Orders')
-    invoices = pd.read_excel(uploaded_file, sheet_name='Invoices')
+# Database configuration
+db_path = 'data.db'
 
-    st.title("Business Dashboard")
-    st.sidebar.title("Navigation")
-    page = st.sidebar.selectbox("Choose a page", ["Overview", "Stock Reports", "Purchase Orders", "Orders", "Invoices"])
+# Initialize SQLite database
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
 
-    if page == "Overview":
-        st.header("Overview")
-        # Total Revenue
-        total_revenue_orders = orders['Total'].sum()
-        total_revenue_invoices = invoices['Total Price'].sum()
-        st.metric("Total Revenue (Orders)", f"${total_revenue_orders:,.2f}")
-        st.metric("Total Revenue (Invoices)", f"${total_revenue_invoices:,.2f}")
+# Create tables for storing data
+def create_tables():
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS StockReports (
+            Filename TEXT,
+            Product TEXT,
+            UnitsSold INTEGER,
+            UnitsInStock INTEGER,
+            UnitPrice REAL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS PurchaseOrders (
+            Filename TEXT,
+            ProductID TEXT,
+            Product TEXT,
+            Quantity INTEGER,
+            UnitPrice REAL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Orders (
+            Filename TEXT,
+            OrderID TEXT,
+            Product TEXT,
+            Quantity INTEGER,
+            UnitPrice REAL,
+            Total REAL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Invoices (
+            Filename TEXT,
+            OrderID TEXT,
+            ProductID TEXT,
+            Product TEXT,
+            Quantity INTEGER,
+            UnitPrice REAL,
+            TotalPrice REAL
+        )
+    """)
+    conn.commit()
 
-        # Top Selling Product (Stock Reports)
-        top_selling_product = stock_reports.loc[stock_reports['Units Sold'].idxmax()]
-        st.write(f"Top Selling Product: **{top_selling_product['Product']}** with **{top_selling_product['Units Sold']} units sold**")
+# Save data to database
+def save_to_database(data, table_name):
+    if not data.empty:
+        data.to_sql(table_name, conn, if_exists='append', index=False)
 
-    elif page == "Stock Reports":
-        st.header("Stock Reports")
-        st.dataframe(stock_reports)
-        fig = px.bar(stock_reports, x='Product', y=['Units Sold', 'Units in Stock'], barmode='group', title="Stock Overview")
-        st.plotly_chart(fig)
+# Extract data from a PDF by path
+def extract_data_from_pdf(file_path):
+    filename = file_path.split("\\")[-1]  # Extract filename from path
+    with pdfplumber.open(file_path) as pdf:
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text()
+    return {"Filename": filename, "Text": text}
 
-    elif page == "Purchase Orders":
-        st.header("Purchase Orders")
-        st.dataframe(purchase_orders)
-        fig = px.pie(purchase_orders, names='Product', values='Quantity', title="Purchase Quantity by Product")
-        st.plotly_chart(fig)
+# Process extracted data into categories
+def process_data(data_dict):
+    stock_reports = []
+    purchase_orders = []
+    orders = []
+    invoices = []
 
-    elif page == "Orders":
-        st.header("Orders")
-        st.dataframe(orders)
-        fig = px.line(orders, x='Order ID', y='Total', title="Revenue per Order")
-        st.plotly_chart(fig)
+    filename = data_dict["Filename"]
+    text = data_dict["Text"]
+    
+    if "Stock Report" in text:
+        items = re.findall(r"(\D+)\s+(\d+)\s+(\d+)\s+([\d.]+)", text)
+        for item in items:
+            stock_reports.append({"Filename": filename, "Product": item[0].strip(), 
+                                  "UnitsSold": item[1], "UnitsInStock": item[2], "UnitPrice": item[3]})
+    
+    if "Purchase Orders" in text:
+        items = re.findall(r"(\d+)\s+([A-Za-z\s]+)\s+(\d+)\s+([\d.]+)", text)
+        for item in items:
+            purchase_orders.append({"Filename": filename, "ProductID": item[0], "Product": item[1].strip(), 
+                                    "Quantity": item[2], "UnitPrice": item[3]})
+    
+    if "Order ID:" in text:
+        order_id_match = re.search(r"Order ID[:\s]+(\d+)", text)
+        if order_id_match:
+            order_id = order_id_match.group(1)
+            products = re.findall(r"Product[:\s]+(.+?)\s+Quantity[:\s]+(\d+)\s+Unit Price[:\s]+([\d.]+)\s+Total[:\s]+([\d.]+)", 
+                                  text, re.DOTALL)
+            for product in products:
+                orders.append({"Filename": filename, "OrderID": order_id, 
+                               "Product": product[0], "Quantity": product[1], 
+                               "UnitPrice": product[2], "Total": product[3]})
+    
+    if "Invoice" in text or "invoice" in text:  
+        order_id_match = re.search(r"Order ID[:\s]+(\d+)", text)
+        if order_id_match:
+            order_id = order_id_match.group(1)
+            items = re.findall(r"(\d+)\s+([A-Za-z'’\s]+)\s+(\d+)\s+([\d.]+)", text)
+            total_price_match = re.search(r"TotalPrice[:\s]+([\d.]+)", text)
+            total_price = total_price_match.group(1) if total_price_match else "N/A"
+            for item in items:
+                invoices.append({"Filename": filename, "OrderID": order_id, 
+                                 "ProductID": item[0], "Product": item[1].strip(), 
+                                 "Quantity": item[2], "UnitPrice": item[3], "TotalPrice": total_price})
 
-    elif page == "Invoices":
-        st.header("Invoices")
-        st.dataframe(invoices)
-        fig = px.scatter(invoices, x='Order ID', y='Total Price', size='Quantity', color='Product', title="Invoices Analysis")
-        st.plotly_chart(fig)
+    return {
+        "StockReports": pd.DataFrame(stock_reports),
+        "PurchaseOrders": pd.DataFrame(purchase_orders),
+        "Orders": pd.DataFrame(orders),
+        "Invoices": pd.DataFrame(invoices),
+    }
+
+# Main Streamlit app
+st.title("Process PDF from File Path")
+
+# Create tables if they don't exist
+create_tables()
+
+# Input the file path
+file_path = st.text_input("Enter the file path of the PDF:")
+
+if file_path:
+    try:
+        extracted_data = extract_data_from_pdf(file_path)
+        categorized_data = process_data(extracted_data)
+
+        # Display and save data into the database
+        if st.button("Process and Save Data"):
+            for table, data in categorized_data.items():
+                save_to_database(data, table)
+            st.success("Data has been processed and saved to the database.")
+
+        # Display extracted data
+        st.header("Extracted Data")
+        for table, data in categorized_data.items():
+            if not data.empty:
+                st.subheader(table)
+                st.dataframe(data)
+
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
